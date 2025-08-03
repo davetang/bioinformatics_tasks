@@ -19,3 +19,112 @@ samtools view -b Aligned.sorted.bam _ViralChr_   >   Aligned.viral.bam
 
 * From [STAR run without gtf file](https://github.com/alexdobin/STAR/issues/1455) make sure that `--quantMode TranscriptomeSAM` and/or `GeneCounts` is not used because you need to supply the GTF file that specifies gene/transcript annotations.
 * [2pass mode without genome annotation](https://github.com/alexdobin/STAR/issues/1207)
+
+## Data
+
+Get download links for SRR953479.
+
+```console
+ffq SRR953479 | grep url
+```
+```
+"urltype": "ftp",
+"url": "ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR953/SRR953479/SRR953479.fastq.gz"
+"urltype": "aws",
+"url": "s3://sra-pub-src-6/SRR953479/MCMV-infected%20fibroblasts%20110317_s_8_1_fastq.txt.gz"
+"urltype": "aws",
+"url": "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR953479/SRR953479"
+"urltype": "aws",
+"url": "s3://sra-pub-zq-8/SRR953479/SRR953479.sralite.1"
+"urltype": "gcp",
+"url": "gs://sra-pub-zq-106/SRR953479/SRR953479.noqual.1"
+"urltype": "ncbi",
+"url": "https://sra-downloadb.be-md.ncbi.nlm.nih.gov/sos5/sra-pub-zq-11/SRR000/953/SRR953479/SRR953479.sralite.1"
+```
+
+Download RNA-seq data from EBI.
+
+```console
+wget -c ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR953/SRR953479/SRR953479.fastq.gz
+```
+
+Download viral reference.
+
+```console
+./datasets download virus genome accession NC_004065.1 --include genome cds annotation
+unzip -d NC_004065.1 ncbi_dataset.zip
+rm ncbi_dataset.zip
+```
+
+Download human reference.
+
+```console
+datasets download genome accession GCF_000001405.40 --include gff3,rna,cds,protein,genome,seq-report
+unzip -d GCF_000001405.40 ncbi_dataset.zip
+rm ncbi_dataset.zip
+cd GCF_000001405.40
+
+# failed twice
+md5sum -c md5sum.txt
+```
+```
+ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna: FAILED
+ncbi_dataset/data/GCF_000001405.40/genomic.gff: FAILED
+```
+
+## STAR reference
+
+Generate reference without the viral genome.
+
+```console
+mkdir -p GRCh38
+STAR \
+    --runThreadN 4 \
+    --runMode genomeGenerate \
+    --genomeDir GRCh38 \
+    --genomeFastaFiles /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna \
+    --sjdbGTFfile /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/genomic.gff \
+    --sjdbOverhang 100
+```
+
+Generate reference with the viral genome.
+
+```console
+mkdir -p GRCh38_NC_004065
+STAR \
+    --runThreadN 4 \
+    --runMode genomeGenerate \
+    --genomeDir GRCh38_NC_004065 \
+    --genomeFastaFiles /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna NC_004065.1/ncbi_dataset/data/genomic.fna \
+    --sjdbGTFfile /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/genomic.gff \
+    --sjdbOverhang 100
+```
+
+## STAR align
+
+Map to single reference.
+
+```console
+STAR \
+   --genomeDir /data/index/GRCh38 \
+   --runThreadN 4 \
+   --readFilesCommand gunzip -c \
+   --readFilesIn SRR953479.fastq.gz \
+   --outSAMtype BAM SortedByCoordinate \
+   --twopassMode Basic \
+   --outFileNamePrefix SRR953479.star.single.
+```
+
+Map to dual reference.
+
+```console
+STAR \
+   --genomeDir /data/index/GRCh38_NC_004065 \
+   --runThreadN 4 \
+   --readFilesCommand gunzip -c \
+   --readFilesIn SRR953479.fastq.gz \
+   --outSAMtype BAM SortedByCoordinate \
+   --twopassMode Basic \
+   --outFileNamePrefix SRR953479.star.dual.
+```
+
