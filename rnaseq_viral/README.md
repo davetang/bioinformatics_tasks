@@ -138,3 +138,21 @@ STAR \
    --outFileNamePrefix SRR953479.star.dual.
 ```
 
+## Mapping statistics
+
+Number of reads mapping to viral genome.
+
+```console
+samtools view SRR953479.star.dual.Aligned.sortedByCoord.out.bam NC_004065.1 | wc -l
+```
+```
+69
+```
+
+However it was reported in [the paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC3784481/#s2) that:
+
+> Of the 33,995,400 reads that passed the filter from infected cells, 11% aligned to MCMV genome indicating a 585-fold coverage of the viral genome.
+
+This is all the information available from the Methods:
+
+> Reads were aligned to mouse (NCBI37/mm9 assembly) and MCMV genome (GenBank acc.no. NC_004065.1) using ELAND aligner or Bowtie aligner (for comparison with data provided by Lars Dölken). It is important to note that both ELAND and Bowtie aligners do not map splice junctions and thus give concordant results.
