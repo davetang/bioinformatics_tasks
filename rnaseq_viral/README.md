@@ -56,20 +56,16 @@ unzip -d NC_004065.1 ncbi_dataset.zip
 rm ncbi_dataset.zip
 ```
 
-Download human reference.
+Download mouse reference.
 
 ```console
-datasets download genome accession GCF_000001405.40 --include gff3,rna,cds,protein,genome,seq-report
-unzip -d GCF_000001405.40 ncbi_dataset.zip
+datasets download genome accession GCF_000001635.27 --include gff3,rna,cds,protein,genome,seq-report
+unzip -d GCF_000001635.27 ncbi_dataset.zip
 rm ncbi_dataset.zip
-cd GCF_000001405.40
+cd GCF_000001635.27
 
-# failed twice
+# all OK!
 md5sum -c md5sum.txt
-```
-```
-ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna: FAILED
-ncbi_dataset/data/GCF_000001405.40/genomic.gff: FAILED
 ```
 
 ## STAR reference
@@ -77,37 +73,50 @@ ncbi_dataset/data/GCF_000001405.40/genomic.gff: FAILED
 Generate reference without the viral genome.
 
 ```console
-mkdir -p GRCh38
+mkdir -p GRCm39
+
 STAR \
     --runThreadN 4 \
     --runMode genomeGenerate \
-    --genomeDir GRCh38 \
-    --genomeFastaFiles /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna \
-    --sjdbGTFfile /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/genomic.gff \
+    --genomeDir GRCm39 \
+    --genomeFastaFiles /data/genome/GCF_000001635.27/ncbi_dataset/data/GCF_000001635.27/GCF_000001635.27_GRCm39_genomic.fna \
+    --sjdbGTFfile /data/genome/GCF_000001635.27/ncbi_dataset/data/GCF_000001635.27/genomic.gff \
     --sjdbOverhang 100
 ```
 
 Generate reference with the viral genome.
 
 ```console
-mkdir -p GRCh38_NC_004065
+mkdir -p GRCm39_NC_004065
+
 STAR \
     --runThreadN 4 \
     --runMode genomeGenerate \
-    --genomeDir GRCh38_NC_004065 \
-    --genomeFastaFiles /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna NC_004065.1/ncbi_dataset/data/genomic.fna \
-    --sjdbGTFfile /data/genome/GCF_000001405.40/ncbi_dataset/data/GCF_000001405.40/genomic.gff \
+    --genomeDir GRCm39_NC_004065 \
+    --genomeFastaFiles /data/genome/GCF_000001635.27/ncbi_dataset/data/GCF_000001635.27/GCF_000001635.27_GRCm39_genomic.fna /data/genome/NC_004065.1/ncbi_dataset/data/genomic.fna \
+    --sjdbGTFfile /data/genome/GCF_000001635.27/ncbi_dataset/data/GCF_000001635.27/genomic.gff \
     --sjdbOverhang 100
 ```
 
 ## STAR align
 
+Unmapped reads can be output into the SAM/BAM `Aligned.*` file(s) with `--outSAMunmapped Within` option. `--outSAMunmapped Within KeepPairs` will (redundantly) record unmapped mate for each alignment, and, in case of unsorted output, keep it adjacent to its mapped mate (this only affects multi-mapping reads).
+
+`uT` SAM tag indicates reason for not mapping:
+
+* 0 : no acceptable seed/windows, ”Unmapped other” in the Log.final.out
+* 1 : best alignment shorter than min allowed mapped length, ”Unmapped: too short” in the Log.final.out
+* 2 : best alignment has more mismatches than max allowed number of mismatches, ”Unmapped: too many mismatches” in the Log.final.out
+* 3 : read maps to more loci than the max number of multimappng loci, ”Multimapping: mapped to too many loci” in the Log.final.out
+* 4 : unmapped mate of a mapped paired-end read
+
 Map to single reference.
 
 ```console
 STAR \
-   --genomeDir /data/index/GRCh38 \
+   --genomeDir /data/index/GRCm39 \
    --runThreadN 4 \
+   --outSAMunmapped Within \
    --readFilesCommand gunzip -c \
    --readFilesIn SRR953479.fastq.gz \
    --outSAMtype BAM SortedByCoordinate \
@@ -119,8 +128,9 @@ Map to dual reference.
 
 ```console
 STAR \
-   --genomeDir /data/index/GRCh38_NC_004065 \
+   --genomeDir /data/index/GRCm39_NC_004065 \
    --runThreadN 4 \
+   --outSAMunmapped Within \
    --readFilesCommand gunzip -c \
    --readFilesIn SRR953479.fastq.gz \
    --outSAMtype BAM SortedByCoordinate \
