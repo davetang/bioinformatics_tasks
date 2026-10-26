@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# Download every file in a public Figshare article and verify its size and MD5.
+# The version comes from -v, a versioned URL or DOI, or defaults to the latest.
+# Files go to figshare_<id>_v<version> unless an output directory is supplied.
+# Re-running skips verified files and resumes partial downloads.
+set -euo pipefail
+
+API_URL=https://api.figshare.com/v2
+USAGE='usage: figshare-dl [-v N] <article-id | figshare URL | DOI> [outdir]'
+
+# Print the first argument as an error to stderr, then stop the script.
+# The optional second argument sets the exit status; it defaults to 1.
+fail() {
+  printf '%s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+# Validate the argument as a positive integer and print it without leading zeros.
+# Work with text to avoid integer overflow; reject invalid input with status 2.
+normalize_number() {
+  local number=$1
+  [[ $number =~ ^[0-9]+$ ]] || fail "expected a positive number, got: $number" 2
+
+  # Strip leading zeros without Bash arithmetic, which can overflow on long IDs.
+  while [[ $number == 0* && ${#number} -gt 1 ]]; do
+    number=${number#0}
+  done
+  [[ $number != 0 ]] || fail 'article IDs and versions must be greater than zero' 2
+  printf '%s\n' "$number"
+}
+
+# Read command-line options and collect the article reference and output directory.
+# Set requested_version, article_input and output_dir for the other functions;
+# handle help immediately and reject missing arguments or unsupported options.
+parse_arguments() {
+  local -a positional=()
+  requested_version=
+
+  while (( $# )); do
+    case $1 in
+      -v)
+        (( $# > 1 )) || fail "$USAGE" 2
+        requested_version=$(normalize_number "$2")
+        shift 2
+        ;;
+      -v*)
+        requested_version=$(normalize_number "${1#-v}")
+        shift
+        ;;
+      -h|--help)
+        printf '%s\n' "$USAGE"
+        exit 0
+        ;;
+      --)
+        shift
+        positional+=("$@")
+        break
+        ;;
+      -*) fail "$USAGE" 2 ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  (( ${#positional[@]} == 1 || ${#positional[@]} == 2 )) || fail "$USAGE" 2
+  article_input=${positional[0]}
+  output_dir=${positional[1]:-}
+}
+
+# Check that curl and jq are available, then choose an installed MD5 utility.
+# Store that choice in checksum_program, preferring md5sum, or exit if unavailable.
+check_dependencies() {
+  local program
+  for program in curl jq; do
+    command -v "$program" >/dev/null || fail "required command not found: $program"
+  done
+  if command -v md5sum >/dev/null; then
+    checksum_program=md5sum
+  elif command -v md5 >/dev/null; then
+    checksum_program=md5
+  else
+    fail 'required command not found: md5sum or md5'
+  fi
+}
+
+# Convert article_input into article_id and any version embedded in the input.
+# Parse numeric IDs and article URLs directly; resolve DOIs through the search API.
+# Normalize the numbers and reject an embedded version that conflicts with -v.
+resolve_article() {
+  local doi search_body path
+  article_id=
+  input_version=
+
+  if [[ $article_input =~ ^[0-9]+$ ]]; then
+    article_id=$article_input
+  elif [[ $article_input =~ (10\.[0-9]+/[^[:space:]?#]+) ]]; then
+    doi=${BASH_REMATCH[1]}
+    if [[ $doi =~ \.v([0-9]+)$ ]]; then
+      input_version=${BASH_REMATCH[1]}
+    fi
+
+    # Search also resolves institutional DOIs, whose suffix need not contain an ID.
+    search_body=$(jq -n --arg doi "$doi" '{doi: $doi}')
+    article_id=$(curl -fsS -X POST "$API_URL/articles/search" \
+      -H 'Content-Type: application/json' -d "$search_body" | jq -r '.[0].id // empty')
+  elif [[ $article_input == */articles/* ]]; then
+    # Remove query/fragment text, then match the full path to avoid numeric slugs.
+    path=${article_input%%[?#]*}
+    path=${path#*/articles/}
+    path=${path%/}
+    if [[ $path =~ ^([0-9]+)(/(versions/)?([0-9]+))?$ ]]; then
+      article_id=${BASH_REMATCH[1]}
+      input_version=${BASH_REMATCH[4]}
+    elif [[ $path =~ ^[^/]+/[^/]+/([0-9]+)(/([0-9]+))?$ ]]; then
+      article_id=${BASH_REMATCH[1]}
+      input_version=${BASH_REMATCH[3]}
+    elif [[ $path =~ ^[^/]+/([0-9]+)(/([0-9]+))?$ ]]; then
+      article_id=${BASH_REMATCH[1]}
+      input_version=${BASH_REMATCH[3]}
+    fi
+  fi
+
+  [[ -n $article_id ]] || fail "could not find a Figshare article ID in: $article_input"
+  article_id=$(normalize_number "$article_id")
+  if [[ -n $input_version ]]; then
+    input_version=$(normalize_number "$input_version")
+  fi
+  if [[ -n $requested_version && -n $input_version && $requested_version != "$input_version" ]]; then
+    fail "-v $requested_version conflicts with version $input_version in $article_input" 2
+  fi
+}
+
+# Fetch the public versions and choose -v, the input's version, or the latest,
+# in that order. Confirm the chosen version exists, then set version,
+# latest_version and article_url for subsequent API requests.
+select_version() {
+  local versions available_versions
+  versions=$(curl -fsS "$API_URL/articles/$article_id/versions")
+  latest_version=$(jq -er '[.[].version] | max // empty' <<< "$versions") ||
+    fail "article $article_id has no public versions"
+  version=${requested_version:-${input_version:-$latest_version}}
+
+  if ! jq -e --arg version "$version" \
+    'any(.[]; (.version | tostring) == $version)' <<< "$versions" >/dev/null; then
+    available_versions=$(jq -r '[.[].version] | join(" ")' <<< "$versions")
+    fail "article $article_id has no version $version; versions: $available_versions"
+  fi
+  article_url=$API_URL/articles/$article_id/versions/$version
+}
+
+# Fetch file metadata for article_url in pages of up to 1,000 entries.
+# Print one JSON object per line until a shorter page marks the end of the list.
+# Return a failure status if any request or JSON conversion fails.
+list_files() {
+  local page=1 batch count
+  while :; do
+    # Check failures explicitly: the caller tests this function's exit status.
+    batch=$(curl -fsS "$article_url/files?page=$page&page_size=1000") || return 1
+    count=$(jq -er 'if type == "array" then length else error("expected a file list") end' \
+      <<< "$batch") || return 1
+    jq -c '.[]' <<< "$batch" || return 1
+    if (( count < 1000 )); then
+      break
+    fi
+    page=$((page + 1))
+  done
+}
+
+# Save the complete file list in work_dir and validate its metadata and filenames.
+# Reject names that would collide after removing directory prefixes, then write
+# NUL-separated URL, filename, size and checksum fields for download_files to read.
+prepare_file_list() {
+  # Finish pagination before downloading so a failed page cannot look like success.
+  list_files > "$work_dir/files.jsonl" || fail 'could not retrieve the complete file list'
+
+  # Reject unsafe names and collisions, including a real file named like another's .part.
+  jq -es '
+    map(.name | split("/") | last) as $names |
+    all(.[];
+      (.download_url | type == "string" and length > 0 and index("\u0000") == null) and
+      (.name | type == "string" and index("\u0000") == null) and
+      (.size | type == "number" and . >= 0 and . == floor) and
+      (.computed_md5 == null or .computed_md5 == "" or
+        (.computed_md5 | test("^[a-fA-F0-9]{32}$")))) and
+    all($names[]; . != "" and . != "." and . != "..") and
+    (($names + ($names | map(. + ".part"))) | length == (unique | length))
+  ' "$work_dir/files.jsonl" >/dev/null || fail 'invalid file metadata or conflicting filenames'
+
+  # NUL separators preserve tabs, newlines and backslashes in filenames; TSV does not.
+  jq -j '[.download_url, (.name | split("/") | last), (.size | tostring),
+    ((.computed_md5 // "") | ascii_downcase)] | .[] + "\u0000"' \
+    "$work_dir/files.jsonl" > "$work_dir/files.nul"
+}
+
+# Print the MD5 digest of the file given as the first argument.
+# Feed its contents through stdin to the selected utility so filenames cannot
+# affect the command's options or the format of its checksum output.
+file_md5() {
+  if [[ $checksum_program == md5sum ]]; then
+    # Hash stdin so unusual filenames do not trigger md5sum filename escaping.
+    md5sum < "$1" | cut -d ' ' -f 1
+  else
+    command md5 -q < "$1"
+  fi
+}
+
+# Check a file against the expected byte count and optional MD5 digest supplied
+# as the second and third arguments. Return success only if the file exists and
+# all supplied checks pass; an empty digest means that only the size is checked.
+file_matches() {
+  local file=$1 expected_size=$2 expected_md5=$3 actual_size actual_md5
+  [[ -f $file ]] || return 1
+  actual_size=$(wc -c < "$file") || return 1
+  [[ ${actual_size//[[:space:]]/} == "$expected_size" ]] || return 1
+  if [[ -n $expected_md5 ]]; then
+    actual_md5=$(file_md5 "$file") || return 1
+    [[ $actual_md5 == "$expected_md5" ]] || return 1
+  fi
+}
+
+# Read the prepared file list, skip matching destinations and resume .part files.
+# Verify each completed download before moving it to its final name. Preserve
+# interrupted downloads for a rerun, discard failed verification results, and
+# set download_failed if any file fails while continuing with the remaining files.
+download_files() {
+  local url name size checksum destination partial partial_size
+  download_failed=0
+  while IFS= read -r -d '' url && IFS= read -r -d '' name &&
+        IFS= read -r -d '' size && IFS= read -r -d '' checksum; do
+    destination=$output_dir/$name
+    partial=$destination.part
+    if [[ -d $destination || -L $destination || -d $partial || -L $partial ]]; then
+      printf 'FAIL  %s: destination or partial path is a directory or symlink\n' "$name" >&2
+      download_failed=1
+      continue
+    fi
+    if file_matches "$destination" "$size" "$checksum"; then
+      printf 'have  %s\n' "$name"
+      continue
+    fi
+
+    # A complete partial file may remain after an interrupted verification/rename.
+    if ! file_matches "$partial" "$size" "$checksum"; then
+      if [[ -f $partial ]]; then
+        partial_size=$(wc -c < "$partial")
+        if (( partial_size >= size )); then
+          rm -f -- "$partial"
+        fi
+      fi
+      printf 'get   %s (%s bytes)\n' "$name" "$size"
+      if ! curl -fL# --retry 3 -C - -o "$partial" -- "$url"; then
+        printf 'FAIL  %s: download error (re-run to resume)\n' "$name" >&2
+        download_failed=1
+        continue
+      fi
+    fi
+
+    if file_matches "$partial" "$size" "$checksum"; then
+      # Keep any old destination until its replacement has passed verification.
+      mv -f -- "$partial" "$destination"
+      printf 'ok    %s\n' "$name"
+      if [[ -z $checksum ]]; then
+        printf '      no checksum published for %s; verified size only\n' "$name" >&2
+      fi
+    else
+      rm -f -- "$partial"
+      printf 'FAIL  %s: size or MD5 mismatch\n' "$name" >&2
+      download_failed=1
+    fi
+  done < "$work_dir/files.nul"
+}
+
+# Run argument parsing, dependency checks, article lookup and version selection.
+# Create the output and temporary directories, arrange temporary-file cleanup,
+# prepare the file list and print the article details. Download the files and
+# exit with the status recorded by download_files.
+main() {
+  local record version_note
+  parse_arguments "$@"
+  check_dependencies
+  resolve_article
+  select_version
+
+  record=$(curl -fsS "$article_url")
+  output_dir=${output_dir:-figshare_${article_id}_v$version}
+  mkdir -p -- "$output_dir"
+  work_dir=$(mktemp -d)
+  trap 'rm -rf -- "$work_dir"' EXIT
+  prepare_file_list
+
+  version_note="latest is $latest_version"
+  if [[ $version == "$latest_version" ]]; then
+    version_note=latest
+  fi
+  jq -r .title <<< "$record"
+  printf 'version %s (%s), doi:%s -> %s/\n' \
+    "$version" "$version_note" "$(jq -r '.doi // ""' <<< "$record")" "$output_dir"
+  download_files
+  exit "$download_failed"
+}
+
+main "$@"
