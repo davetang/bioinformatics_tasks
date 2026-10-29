@@ -17,12 +17,15 @@ cause an error rather than guessed transcript models. Input order does not matte
 
 Other limitations:
     - Exons must have a known strand (+ or -); . and ? are rejected.
-    - Gene features must be named gene or pseudogene. Transcript features must
+    - Gene features must be named gene, ncRNA_gene (Ensembl), or pseudogene. Transcript features must
       be named transcript, end in RNA, or end in _transcript. Other naming
       conventions or parent hierarchies may require changes to this script.
     - Only gene_id, transcript_id, and gene_name are written as attributes.
       Product descriptions, database links, biotypes, and other metadata are
       omitted. If a gene has no Name, its ID is used as gene_name.
+    - Spaces, semicolons, = and quotes in gene names stay percent-encoded as
+      in GFF3 (e.g. CYCA2%3B3), because STAR would cut the name at them. IDs
+      containing these characters are rejected instead.
     - This is not a complete GFF3 validator. For another annotation source,
       inspect its structure and independently validate the converted output.
 
@@ -82,7 +85,7 @@ def read_gene_and_transcript_ids(filename):
 
     for line_number, columns in read_gff3(filename):
         feature_type = columns[2]
-        is_gene = feature_type in ("gene", "pseudogene")
+        is_gene = feature_type in ("gene", "ncRNA_gene", "pseudogene")
         is_transcript = (
             feature_type in ("transcript", "pseudogenic_transcript")
             or feature_type.endswith("RNA")
@@ -135,11 +138,22 @@ def read_fasta_lengths(filename):
     return lengths
 
 
+# STAR turns these into spaces and keeps only the first word of each attribute
+# value (see source/GTF.cpp), so 'CYCA2;3' would be read as 'CYCA2'.
+STAR_SEPARATORS = (" ", "\t", "\r", "\n", ";", "=", '"')
+
+
 def quote_gtf(value):
     """Put a value in GTF quotes; reject characters STAR may misinterpret."""
-    if not value or any(character in value for character in ('"', "\\", ";", "\t", "\r", "\n")):
+    if not value or any(character in value for character in STAR_SEPARATORS + ("\\",)):
         raise ValueError(f"Cannot safely write this value as a STAR GTF attribute: {value!r}")
     return f'"{value}"'
+
+
+def encode_gene_name(name):
+    """Keep GFF3 percent-encoding for characters STAR splits on: 'CYCA2;3' -> 'CYCA2%3B3'."""
+    unsafe = STAR_SEPARATORS + ("\\", "%")  # Encoding % too keeps this reversible.
+    return "".join(f"%{ord(character):02X}" if character in unsafe else character for character in name)
 
 
 def convert_gff3(input_file, output_file, fasta_file=None):
@@ -192,7 +206,7 @@ def convert_gff3(input_file, output_file, fasta_file=None):
             columns[8] = (
                 f"gene_id {quote_gtf(gene_id)}; "
                 f"transcript_id {quote_gtf(transcript_id)}; "
-                f"gene_name {quote_gtf(gene_names[gene_id])};"
+                f"gene_name {quote_gtf(encode_gene_name(gene_names[gene_id]))};"
             )
             # A shared exon gets one row per parent transcript.
             output_lines.append("\t".join(columns) + "\n")
